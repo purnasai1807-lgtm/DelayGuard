@@ -1,0 +1,2 @@
+request_id,department,service_type,request_date,sla_deadline,current_stage,stage_start_time,priority,historical_stage_avg_hours,historical_stage_delay_rate,department_delay_rate,previous_delays
+REQ-1042,Revenue,Property assessment,2026-08-21T00:00:00+00:00,2026-08-23T11:00:00+00:00,Document Verification,2026-08-22T01:00:00+00:00,High,6,35,100,8

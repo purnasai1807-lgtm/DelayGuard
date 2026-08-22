@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: delayguard
+      POSTGRES_PASSWORD: delayguard
+      POSTGRES_DB: delayguard
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U delayguard -d delayguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://delayguard:delayguard@db:5432/delayguard
+      JWT_SECRET: local-development-secret
+      CORS_ORIGINS: http://localhost:5173,http://localhost
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+  frontend:
+    build: ./frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+volumes:
+  postgres_data:
