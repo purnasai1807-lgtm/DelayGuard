@@ -45,7 +45,7 @@ async def rate_limit_error(_: Request, __: RateLimitExceeded) -> JSONResponse:
     return JSONResponse(status_code=429, content={"success": False, "error": {"code": "RATE_LIMITED", "message": "Too many requests"}})
 
 
-app.add_exception_handler(RateLimitExceeded, rate_limit_error)
+app.add_exception_handler(RateLimitExceeded, cast(Any, rate_limit_error))
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("delayguard")
 app.add_middleware(CORSMiddleware, allow_origins=[item.strip() for item in settings.cors_origins.split(",")], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -314,6 +314,26 @@ def dashboard(db: Session = Depends(get_db), _: User = Depends(current_user)) ->
         group = [row for row in payloads if row["department"] == department]
         departments.append({"department": department, "request_count": len(group), "average_risk": round(sum(row["risk_score"] for row in group) / len(group), 1), "sla_compliance": round(sum(row["status"] == "ON_TRACK" for row in group) / len(group) * 100, 1)})
     return {"success": True, "data": {"stats": {"total": len(payloads), **counts, "at_risk": counts["AT_RISK"] + counts["CRITICAL"]}, "risk_distribution": risk_distribution, "departments": departments, "bottlenecks": summarize_bottlenecks(payloads)[:6], "urgent_requests": sorted(payloads, key=lambda row: row["risk_score"], reverse=True)[:10]}}
+
+
+@app.post("/api/predictions/run")
+def refresh_predictions(db: Session = Depends(get_db), _: User = Depends(current_user)) -> dict[str, Any]:
+    rows = db.scalars(select(ServiceRequest).where(ServiceRequest.status != "BREACHED")).all()
+    for item in rows:
+        request_payload(item)
+    db.commit()
+    return {"success": True, "data": {"updated": len(rows), "message": "Risk predictions refreshed"}}
+
+
+@app.get("/api/alerts")
+def alerts(db: Session = Depends(get_db), _: User = Depends(current_user)) -> dict[str, Any]:
+    alerts_data: list[dict[str, Any]] = []
+    alert_query = select(ServiceRequest).where(ServiceRequest.status.in_(["CRITICAL", "AT_RISK", "BREACHED"])).order_by(ServiceRequest.risk_score.desc()).limit(50)
+    for item in db.scalars(alert_query).all():
+        data = request_payload(item)
+        alert_type = "OVERDUE" if data["status"] == "BREACHED" else "CRITICAL_RISK" if data["risk_level"] == "CRITICAL" else "DEADLINE_APPROACHING"
+        alerts_data.append({"type": alert_type, "request_id": data["request_id"], "risk_level": data["risk_level"], "risk_score": data["risk_score"], "message": f"{data['request_id']} requires attention before its SLA is breached.", "action": data["recommended_action"]})
+    return {"success": True, "data": alerts_data}
 
 
 @app.get("/api/dashboard/summary")
