@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict
@@ -54,3 +55,18 @@ class AuthIn(BaseModel):
 class RegisterIn(AuthIn):
     name: str
     confirm_password: str
+
+
+class RequestIn(BaseModel):
+    request_id: str
+    department: str
+    service_type: str
+    request_date: datetime
+    sla_deadline: datetime
+    current_stage: str
+    stage_start_time: datetime
+    priority: str
+    historical_stage_avg_hours: float
+    historical_stage_delay_rate: float
+    department_delay_rate: float
+    previous_delays: int = 0
