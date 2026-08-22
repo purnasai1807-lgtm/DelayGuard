@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 T = TypeVar("T")
 
@@ -70,3 +70,16 @@ class RequestIn(BaseModel):
     historical_stage_delay_rate: float
     department_delay_rate: float
     previous_delays: int = 0
+
+
+class StatusUpdateIn(BaseModel):
+    status: str
+    reason: str = ""
+
+
+class NoteIn(BaseModel):
+    content: str = Field(min_length=1, max_length=5000)
+
+
+class RoleUpdateIn(BaseModel):
+    role: str
