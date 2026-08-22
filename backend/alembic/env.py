@@ -10,6 +10,8 @@ from app.db.session import Base
 from app.models import ServiceRequest, User
 
 config = context.config
+if os.getenv("DATABASE_URL"):
+    config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL").replace("%", "%%"))
 if config.config_file_name:
     fileConfig(config.config_file_name)
 target_metadata = Base.metadata

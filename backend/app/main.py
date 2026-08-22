@@ -1,12 +1,19 @@
 from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+import logging
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
@@ -30,9 +37,37 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="DelayGuard API", version="1.0.0", lifespan=lifespan)
+limiter: Any = cast(Any, Limiter(key_func=get_remote_address, default_limits=["120/minute"]))
+app.state.limiter = limiter
+
+
+async def rate_limit_error(_: Request, __: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(status_code=429, content={"success": False, "error": {"code": "RATE_LIMITED", "message": "Too many requests"}})
+
+
+app.add_exception_handler(RateLimitExceeded, rate_limit_error)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("delayguard")
 app.add_middleware(CORSMiddleware, allow_origins=[item.strip() for item in settings.cors_origins.split(",")], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 upload_jobs: dict[str, dict[str, Any]] = {}
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"success": False, "error": {"code": "VALIDATION_ERROR", "message": "Invalid request data"}})
+
+
+@app.exception_handler(HTTPException)
+async def http_error(_: Request, exc: HTTPException) -> JSONResponse:
+    code = "UNAUTHORIZED" if exc.status_code == 401 else "NOT_FOUND" if exc.status_code == 404 else "CONFLICT" if exc.status_code == 409 else "REQUEST_ERROR"
+    return JSONResponse(status_code=exc.status_code, content={"success": False, "error": {"code": code, "message": str(exc.detail)}})
+
+
+@app.exception_handler(Exception)
+async def server_error(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled request error: %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"success": False, "error": {"code": "INTERNAL_ERROR", "message": "An unexpected server error occurred"}})
 
 
 def current_user(token: str = Depends(oauth2), db: Session = Depends(get_db)) -> User:
@@ -61,7 +96,8 @@ def health(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 
 @app.post("/api/auth/register")
-def register(payload: RegisterIn, db: Session = Depends(get_db)) -> dict[str, Any]:
+@limiter.limit("5/minute")
+def register(request: Request, payload: RegisterIn, db: Session = Depends(get_db)) -> dict[str, Any]:
     if payload.password != payload.confirm_password or len(payload.password) < 8:
         raise HTTPException(status_code=422, detail="Invalid registration data")
     if db.scalar(select(User).where(User.email == payload.email.lower())):
@@ -72,7 +108,8 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)) -> dict[str, An
 
 
 @app.post("/api/auth/login")
-def login(payload: AuthIn, db: Session = Depends(get_db)) -> dict[str, Any]:
+@limiter.limit("10/minute")
+def login(request: Request, payload: AuthIn, db: Session = Depends(get_db)) -> dict[str, Any]:
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -188,7 +225,8 @@ def delete_request(request_id: str, db: Session = Depends(get_db), _: User = Dep
 
 
 @app.post("/api/requests/{request_id}/analyze")
-def analyze(request_id: str, db: Session = Depends(get_db), _: User = Depends(current_user)) -> dict[str, Any]:
+@limiter.limit("30/minute")
+def analyze(request: Request, request_id: str, db: Session = Depends(get_db), _: User = Depends(current_user)) -> dict[str, Any]:
     item = db.scalar(select(ServiceRequest).where(ServiceRequest.request_id == request_id))
     if not item: raise HTTPException(status_code=404, detail="Request not found")
     data = request_payload(item); db.commit()
@@ -226,7 +264,8 @@ def explain_request(request_id: str, db: Session = Depends(get_db), _: User = De
 def request_bottleneck(request_id: str, db: Session = Depends(get_db), _: User = Depends(current_user)) -> dict[str, Any]:
     item = find_request(request_id, db)
     matches = summarize_bottlenecks([request_payload(row) for row in db.scalars(select(ServiceRequest).where(ServiceRequest.current_stage == item.current_stage)).all()])
-    result = next((row for row in matches if row["stage"] == item.current_stage), {"stage": item.current_stage, "delay_rate": item.historical_stage_delay_rate, "affected_requests": 0})
+    fallback: dict[str, Any] = {"stage": item.current_stage, "delay_rate": item.historical_stage_delay_rate, "affected_requests": 0}
+    result: dict[str, Any] = next((row for row in matches if row["stage"] == item.current_stage), fallback)
     return {"success": True, "data": result}
 
 
@@ -241,7 +280,10 @@ def recommend_request(request_id: str, db: Session = Depends(get_db), _: User = 
 
 
 @app.post("/api/requests/upload")
-def upload(file: UploadFile = File(...), db: Session = Depends(get_db), _: User = Depends(current_user)) -> dict[str, Any]:
+@limiter.limit("10/minute")
+def upload(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db), _: User = Depends(current_user)) -> dict[str, Any]:
+    if request.headers.get("content-length") and int(request.headers["content-length"]) > settings.max_upload_size:
+        raise HTTPException(status_code=413, detail="Upload exceeds configured size limit")
     if not file.filename or Path(file.filename).suffix.lower() != ".csv": raise HTTPException(status_code=400, detail="Unsupported file type")
     valid, errors = validate_csv(file.file)
     created = 0
